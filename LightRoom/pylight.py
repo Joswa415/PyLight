@@ -4,6 +4,7 @@ Run:  python pylight.py [optional_image_path]
 """
 import copy
 import json
+import math
 import os
 import shutil
 import sys
@@ -32,7 +33,7 @@ from ui_shell import (Canvas, Surface, TabBar, ExportBar, TopPill, Histogram2, T
                       HistoryPanel, Toast, PngPopup, BLUR, PURPLE, PANEL, TXT, TXT_DIM)
 import png_convert
 
-MASK_TOOLS = ('linear', 'radial', 'brush', 'edit')
+MASK_TOOLS = ('linear', 'radial', 'brush', 'auto', 'edit')
 
 PRESET_DIR = Path.home() / '.pylight' / 'presets'
 SIDECAR = '.pylight.json'
@@ -564,6 +565,7 @@ class MainWindow(QMainWindow):
         act(lambda: self.pick_mask_tool('linear'), 'L')
         act(lambda: self.pick_mask_tool('radial'), 'O')
         act(lambda: self.pick_mask_tool('brush'), 'B')
+        act(lambda: self.pick_mask_tool('auto'), 'A')
         act(lambda: self.set_tool('hand'), 'H')
         act(lambda: self.set_erase(not self.brush['erase']), 'E')
         act(self.delete_under_cursor, 'Delete', 'Backspace')
@@ -643,6 +645,10 @@ class MainWindow(QMainWindow):
             m = self.cur_mask()
             if m is None:
                 return None
+            if path[1] == 'rotate':
+                return self.mask_angle(m) if m['type'] in ('linear', 'radial') else None
+            if path[1] == 'tol':
+                return m['tol'] if m['type'] == 'auto' else None
             base = m
             for k in path[1:-1]:
                 base = base[k]
@@ -694,8 +700,10 @@ class MainWindow(QMainWindow):
             break
 
     def open_dialog(self):
-        exts = ' '.join('*' + x for x in sorted(E.IMG_EXT))
-        p, _ = QFileDialog.getOpenFileName(self, 'Open photo', '', f'Images ({exts});;All files (*)')
+        raw = ' '.join('*' + x for x in sorted(E.RAW_EXT))
+        allx = ' '.join('*' + x for x in sorted(E.IMG_EXT))
+        p, _ = QFileDialog.getOpenFileName(self, 'Add a RAW photo', '',
+                                           f'RAW photos ({raw});;All photos ({allx});;All files (*)')
         if p:
             self.open_path(p)
 
@@ -801,6 +809,21 @@ class MainWindow(QMainWindow):
 
     def on_slider(self, path, val, final):
         if not self.photo:
+            return
+        if path == ('mask', 'rotate'):
+            mk = self.cur_mask()
+            if mk is not None and mk['type'] in ('linear', 'radial'):
+                self.set_mask_angle(mk, float(val))
+                self.update_overlay()
+                self.after_change(final, 'Rotate mask')
+            return
+        if path == ('mask', 'tol'):
+            mk = self.cur_mask()
+            if mk is not None and mk['type'] == 'auto':
+                mk['tol'] = float(val)
+                self.rebuild_auto(mk)
+                self.update_overlay()
+                self.after_change(final, 'Auto tolerance')
             return
         base, key = self.resolve(path)
         if base is None:
@@ -1068,6 +1091,12 @@ class MainWindow(QMainWindow):
                 p.drawLine(QPointF(cx - 5 * u, cy), QPointF(cx + 5 * u, cy))
             p.setPen(QPen(QColor(*rgb, 120), 1.0 * u, Qt.DashLine))
             p.drawEllipse(QPointF(cx, cy), rr * (1 - 0.5 * self.brush['feather']), rr * (1 - 0.5 * self.brush['feather']))
+        if self.drag and self.drag[0] == 'auto':
+            (x0, y0), (x1, y1) = self.drag[1], self.drag[2]
+            if abs(x1 - x0) * fw > 8 or abs(y1 - y0) * fh > 8:
+                p.setPen(QPen(QColor(255, 255, 255, 235), 1.5 * u, Qt.DashLine))
+                p.setBrush(QColor(255, 255, 255, 28))
+                p.drawRect(QRectF(QPointF(x0 * fw, y0 * fh), QPointF(x1 * fw, y1 * fh)).normalized())
         m = self.cur_mask()
         if not m or self.tool not in MASK_TOOLS:
             return
@@ -1076,9 +1105,9 @@ class MainWindow(QMainWindow):
         pen = QPen(QColor(255, 255, 255, 230), 1.5 * u)
         p.setPen(pen)
         p.setBrush(QColor(255, 255, 255, 80))
+        hs = self.mask_handles(m, u) if m['type'] in ('linear', 'radial') else None
         if m['type'] == 'linear':
-            a = QPointF(m['p1'][0] * fw, m['p1'][1] * fh)
-            b = QPointF(m['p2'][0] * fw, m['p2'][1] * fh)
+            a, b, mid, knob = hs['p1'], hs['p2'], hs['mid'], hs['rot']
             d = b - a
             ln = max((d.x() ** 2 + d.y() ** 2) ** .5, 1e-6)
             n = QPointF(-d.y() / ln, d.x() / ln) * max(fw, fh)
@@ -1087,20 +1116,98 @@ class MainWindow(QMainWindow):
             p.drawLine(b - n, b + n)
             p.setPen(pen)
             p.drawLine(a, b)
+            p.setPen(QPen(QColor(255, 255, 255, 150), 1.2 * u))
+            p.drawLine(mid, knob)  # stem to the rotate knob
+            p.setPen(pen)
+            p.setBrush(QColor(255, 255, 255, 80))
             for q in (a, b):
                 p.drawEllipse(q, 7 * u, 7 * u)
+            p.setBrush(QColor(255, 255, 255, 230))
+            p.drawEllipse(mid, 4.5 * u, 4.5 * u)  # centre pin: drag to move the whole mask
+            self.draw_knob(p, knob, u)
         elif m['type'] == 'radial':
-            c = QPointF(m['c'][0] * fw, m['c'][1] * fh)
+            c = hs['c']
             p.setBrush(Qt.NoBrush)
-            p.drawEllipse(c, m['r'][0] * fw, m['r'][1] * fh)
+            p.save()
+            p.translate(c)
+            p.rotate(m.get('rot', 0.0))
+            p.drawEllipse(QPointF(0, 0), m['r'][0] * fw, m['r'][1] * fh)
+            p.restore()
+            edge = c + (c - hs['ry'])  # top of the ellipse, where the rotate stem starts
+            p.setPen(QPen(QColor(255, 255, 255, 150), 1.2 * u))
+            p.drawLine(edge, hs['rot'])
+            p.setPen(pen)
             p.setBrush(QColor(255, 255, 255, 120))
-            for q in self.radial_handles(m).values():
-                p.drawEllipse(q, 6 * u, 6 * u)
+            for k2, q in hs.items():
+                if k2 != 'rot':
+                    p.drawEllipse(q, 6 * u, 6 * u)
+            self.draw_knob(p, hs['rot'], u)
+
+    def draw_knob(self, p, q, u):
+        """Round rotate handle with a little circular arrow."""
+        p.setPen(QPen(QColor(255, 255, 255, 235), 1.5 * u))
+        p.setBrush(QColor(30, 30, 44, 215))
+        p.drawEllipse(q, 10 * u, 10 * u)
+        p.setBrush(Qt.NoBrush)
+        p.drawArc(QRectF(q.x() - 4.5 * u, q.y() - 4.5 * u, 9 * u, 9 * u), 60 * 16, 270 * 16)
+
+    # ---- mask geometry / rotation
+    def mask_handles(self, m, u=0.0):
+        """Scene positions of a linear / radial mask's handles.  u = scene units per screen pixel."""
+        fw, fh = self.fw, self.fh
+        if m['type'] == 'linear':
+            a = QPointF(m['p1'][0] * fw, m['p1'][1] * fh)
+            b = QPointF(m['p2'][0] * fw, m['p2'][1] * fh)
+            d = b - a
+            ln = max((d.x() ** 2 + d.y() ** 2) ** .5, 1e-6)
+            nu = QPointF(-d.y() / ln, d.x() / ln)
+            mid = (a + b) / 2
+            return {'rot': mid + nu * (58 * u), 'mid': mid, 'p1': a, 'p2': b}
+        c = QPointF(m['c'][0] * fw, m['c'][1] * fh)
+        r = math.radians(m.get('rot', 0.0))
+        ax, ay = QPointF(math.cos(r), math.sin(r)), QPointF(-math.sin(r), math.cos(r))
+        rxp, ryp = m['r'][0] * fw, m['r'][1] * fh
+        return {'rot': c - ay * (ryp + 30 * u), 'c': c, 'rx': c + ax * rxp, 'ry': c + ay * ryp}
+
+    def mask_angle(self, m):
+        """Rotation in degrees (-180..180).  0 = the default look (linear fades downwards, radial is upright)."""
+        if m['type'] == 'radial':
+            return float(m.get('rot', 0.0))
+        (x1, y1), (x2, y2) = m['p1'], m['p2']
+        a = math.degrees(math.atan2((y2 - y1) * self.fh, (x2 - x1) * self.fw)) - 90
+        return (a + 180) % 360 - 180
+
+    def set_mask_angle(self, m, deg):
+        deg = (deg + 180) % 360 - 180
+        if m['type'] == 'radial':
+            m['rot'] = deg
+            return
+        fw, fh = self.fw, self.fh
+        (x1, y1), (x2, y2) = m['p1'], m['p2']
+        mx, my = (x1 + x2) / 2 * fw, (y1 + y2) / 2 * fh
+        ln = math.hypot((x2 - x1) * fw, (y2 - y1) * fh)
+        a = math.radians(deg + 90)
+        dx, dy = math.cos(a) * ln / 2, math.sin(a) * ln / 2
+        m['p1'], m['p2'] = [(mx - dx) / fw, (my - dy) / fh], [(mx + dx) / fw, (my + dy) / fh]
+
+    def rotate_mask_to(self, m, sx, sy):
+        """Turn the mask so its rotate knob points at the mouse (Shift snaps to 15 degrees)."""
+        fw, fh = self.fw, self.fh
+        if m['type'] == 'radial':
+            ox, oy = m['c'][0] * fw, m['c'][1] * fh
+        else:
+            ox, oy = (m['p1'][0] + m['p2'][0]) / 2 * fw, (m['p1'][1] + m['p2'][1]) / 2 * fh
+        vx, vy = sx - ox, sy - oy
+        if vx * vx + vy * vy < 4:
+            return
+        # the knob sits straight "above" a radial mask and beside a linear one
+        deg = math.degrees(math.atan2(vx, -vy)) if m['type'] == 'radial' else math.degrees(math.atan2(-vx, vy)) - 90
+        if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+            deg = round(deg / 15) * 15
+        self.set_mask_angle(m, deg)
 
     def radial_handles(self, m):
-        fw, fh = self.fw, self.fh
-        cx, cy = m['c'][0] * fw, m['c'][1] * fh
-        return {'c': QPointF(cx, cy), 'rx': QPointF(cx + m['r'][0] * fw, cy), 'ry': QPointF(cx, cy + m['r'][1] * fh)}
+        return self.mask_handles(m)
 
     def crop_handles(self):
         x0, y0, x1, y1 = [v * d for v, d in zip(self.crop_rect, (self.fw, self.fh, self.fw, self.fh))]
@@ -1126,12 +1233,36 @@ class MainWindow(QMainWindow):
             return True
         m = self.cur_mask()
         if m and m['type'] in ('linear', 'radial') and (self.tool == 'edit' or m['type'] == self.tool):
-            hs = ({'p1': QPointF(m['p1'][0] * fw, m['p1'][1] * fh), 'p2': QPointF(m['p2'][0] * fw, m['p2'][1] * fh)}
-                  if m['type'] == 'linear' else self.radial_handles(m))
+            hs = self.mask_handles(m, 1.0 / max(scale, 1e-6))
             for k, q in hs.items():
                 if (q.x() - sx) ** 2 + (q.y() - sy) ** 2 < tol * tol:
-                    self.drag = ('handle', k)
+                    if k == 'mid':
+                        self.drag = ('move', (sx / fw, sy / fh, copy.deepcopy(m)))
+                    else:
+                        self.drag = ('handle', k)
                     return True
+            if self.tool == 'edit':  # grab the mask itself to slide it around
+                hit = False
+                if m['type'] == 'radial':
+                    c, r = hs['c'], math.radians(m.get('rot', 0.0))
+                    vx, vy = sx - c.x(), sy - c.y()
+                    u_ = vx * math.cos(r) + vy * math.sin(r)
+                    v_ = -vx * math.sin(r) + vy * math.cos(r)
+                    hit = (u_ / max(m['r'][0] * fw, 1e-6)) ** 2 + (v_ / max(m['r'][1] * fh, 1e-6)) ** 2 <= 1
+                else:
+                    a, b = hs['p1'], hs['p2']
+                    ab = b - a
+                    L2 = max(ab.x() ** 2 + ab.y() ** 2, 1e-6)
+                    t = min(1, max(0, ((sx - a.x()) * ab.x() + (sy - a.y()) * ab.y()) / L2))
+                    hit = (a.x() + ab.x() * t - sx) ** 2 + (a.y() + ab.y() * t - sy) ** 2 < (tol * 0.7) ** 2
+                if hit:
+                    self.drag = ('move', (sx / fw, sy / fh, copy.deepcopy(m)))
+                    return True
+        if self.tool == 'auto':
+            mods = QApplication.keyboardModifiers()
+            mode = 'add' if mods & Qt.ShiftModifier else 'sub' if mods & Qt.AltModifier else 'set'
+            self.drag = ('auto', (nx, ny), (nx, ny), mode)
+            return True
         if self.tool in ('linear', 'radial'):
             nm = E.new_mask(self.tool)
             if self.tool == 'linear':
@@ -1176,15 +1307,31 @@ class MainWindow(QMainWindow):
             self.update_overlay()
         elif kind == 'handle' and m:
             k = self.drag[1]
-            if k in ('p1', 'p2'):
+            if k == 'rot':
+                self.rotate_mask_to(m, sx, sy)
+            elif k in ('p1', 'p2'):
                 m[k] = [nx, ny]
             elif k == 'c':
                 dx, dy = nx - m['c'][0], ny - m['c'][1]
                 m['c'] = [nx, ny]
-            elif k == 'rx':
-                m['r'][0] = max(0.005, abs(nx - m['c'][0]))
+            elif k in ('rx', 'ry'):
+                r = math.radians(m.get('rot', 0.0))  # measure along the (rotated) axis
+                vx, vy = sx - m['c'][0] * fw, sy - m['c'][1] * fh
+                if k == 'rx':
+                    m['r'][0] = max(0.005, abs(vx * math.cos(r) + vy * math.sin(r)) / fw)
+                else:
+                    m['r'][1] = max(0.005, abs(-vx * math.sin(r) + vy * math.cos(r)) / fh)
+            self.update_overlay()
+        elif kind == 'auto':
+            self.drag = ('auto', self.drag[1], (nx, ny), self.drag[3])
+        elif kind == 'move' and m:
+            x0, y0, orig = self.drag[1]
+            dx, dy = sx / fw - x0, sy / fh - y0
+            if m['type'] == 'linear':
+                m['p1'] = [orig['p1'][0] + dx, orig['p1'][1] + dy]
+                m['p2'] = [orig['p2'][0] + dx, orig['p2'][1] + dy]
             else:
-                m['r'][1] = max(0.005, abs(ny - m['c'][1]))
+                m['c'] = [orig['c'][0] + dx, orig['c'][1] + dy]
             self.update_overlay()
         elif kind == 'brush':
             pts = self.drag[1]['pts']
@@ -1193,7 +1340,7 @@ class MainWindow(QMainWindow):
                 self.update_overlay()
                 self.request(False)
             return
-        if kind != 'crop':
+        if kind not in ('crop', 'auto'):
             self.request(False)
         self.view.viewport().update()
 
@@ -1203,6 +1350,9 @@ class MainWindow(QMainWindow):
             return
         if d[0] == 'crop':
             return
+        if d[0] == 'auto':
+            self.make_auto_mask(d[1], d[2], d[3])
+            return
         m = self.cur_mask()
         if d[0] == 'new' and m:
             if (m['type'] == 'linear' and m['p1'] == m['p2']) or (m['type'] == 'radial' and m['r'][0] < 0.01):
@@ -1210,11 +1360,90 @@ class MainWindow(QMainWindow):
                 self.sel = len(self.S['masks']) - 1
                 self.refresh_masks_ui()
                 return
-        self.commit(f'{d[0]} mask')
+        self.commit('Rotate mask' if d[:2] == ('handle', 'rot') else f'{d[0]} mask')
         self.request(True)
         if d[0] == 'new':
             self.set_tool('edit')  # keep the handles draggable, stop creating new masks
         self.refresh_masks_ui()
+
+    # ------------------------------------------------------------------ auto select
+    def auto_cache(self):
+        """Smoothed work copy of the framed photo, rebuilt only when the crop / straighten / flip changes."""
+        S = self.S
+        key = (self.photo.path, tuple(S['crop']), S['angle'], tuple(S['flip']))
+        if getattr(self, '_auto_key', None) != key:
+            frame = E.geometry(self.photo.source(512), S, True)
+            self._auto_cache, self._auto_key = E.auto_cache(frame), key
+        return self._auto_cache
+
+    def rebuild_auto(self, mk):
+        bmp = E.auto_build(self.auto_cache(), mk['ops'], mk['tol'])
+        if bmp is not None:
+            mk['bmp'] = E.encode_mask(bmp)
+
+    def make_auto_mask(self, p0, p1, mode):
+        """Click = select the similar area under the cursor.  Drag = cut out the subject inside the box."""
+        if not self.photo:
+            return
+        fw, fh = self.fw, self.fh
+        boxed = abs(p1[0] - p0[0]) * fw > 8 or abs(p1[1] - p0[1]) * fh > 8
+        op = {'op': 'set'}
+        if boxed:
+            op['rect'] = [min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1])]
+        else:
+            op['seed'] = [p0[0], p0[1]]
+        cur = self.cur_mask()
+        editing = mode in ('add', 'sub') and cur is not None and cur['type'] == 'auto'
+        if editing:
+            op['op'] = mode
+        mk = cur if editing else E.new_mask('auto')
+        ops = (mk['ops'] if editing else []) + [op]
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            bmp = E.auto_build(self.auto_cache(), ops, mk['tol'])
+        except Exception as ex:
+            bmp = None
+            traceback.print_exc()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if bmp is None or not bmp.any():
+            self.toast.say("Couldn't find an area there - raise Tolerance, or drag a box around it")
+            return
+        mk['ops'], mk['bmp'] = ops, E.encode_mask(bmp)
+        if not editing:
+            self.S['masks'].append(mk)
+            self.sel = len(self.S['masks']) - 1
+        self.commit('Refine auto mask' if editing else 'Auto mask')
+        self.refresh_masks_ui()
+        self.update_overlay()
+        self.request(True)
+
+    def make_auto_whole(self, kind):
+        """Whole-photo detection: kind = 'subject' or 'background'."""
+        if not self.photo:
+            return
+        mk = E.new_mask('auto')
+        ops = [{'op': 'set', 'auto': kind}]
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            bmp = E.auto_build(self.auto_cache(), ops, mk['tol'])
+        except Exception:
+            bmp = None
+            traceback.print_exc()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if bmp is None or not bmp.any():
+            self.toast.say("Couldn't tell the subject from the background - try dragging a box around the subject")
+            return
+        mk['ops'], mk['bmp'] = ops, E.encode_mask(bmp)
+        self.S['masks'].append(mk)
+        self.sel = len(self.S['masks']) - 1
+        self.commit('Auto ' + kind)
+        self.refresh_masks_ui()
+        self.update_overlay()
+        self.request(True)
 
     # ------------------------------------------------------------------ crop
     def begin_crop(self):

@@ -44,7 +44,7 @@ ICON_KEY = {
     'vignette': 'vig', 'midpoint': 'conc', 'feather': 'dashring', 'grain': 'dots', 'sharpening': 'tri',
     'radius': 'radius', 'noise': 'dots', 'color noise': 'dots', 'amount': 'pie', 'range min': 'bars',
     'range max': 'bars', 'brush size': 'disc', 'brush feather': 'dashring', 'brush flow': 'drops', 'free': 'free',
-    'original': 'orig', 'straighten': 'seesaw',
+    'original': 'orig', 'straighten': 'seesaw', 'rotate': 'seesaw', 'tolerance': 'dots',
 }
 
 
@@ -56,7 +56,7 @@ def icon_key(name):
         return 'wheel'
     if ':' in n:
         return 'ratio'
-    for w in ('linear', 'radial', 'brush'):
+    for w in ('linear', 'radial', 'brush', 'auto'):
         if n.startswith(w):
             return w
     return 'dot'
@@ -195,6 +195,14 @@ def paint_icon(p, key, name=''):
         pen.setWidthF(1.7)
         p.setPen(pen)
         p.drawEllipse(P(8, 20), 3.5, 3.5)
+    elif key == 'auto':  # magic wand with a sparkle
+        p.drawLine(P(5, 23), P(15, 13))
+        p.drawLine(P(19, 3), P(19, 11))
+        p.drawLine(P(15, 7), P(23, 7))
+        p.drawLine(P(16.2, 4.2), P(21.8, 9.8))
+        p.drawLine(P(21.8, 4.2), P(16.2, 9.8))
+        disc(8, 9, 1.4)
+        disc(22, 18, 1.4)
     elif key == 'ratio':
         try:
             a, b = (float(x) for x in name.split(':')[:2])
@@ -665,6 +673,8 @@ MASK_ITEMS = ([spec(n, '', lo, hi, d, st, dec, path=('mask', 'adj', k)) for n, k
     ('Clarity', 'clarity', -100, 100, 0, 1, 0), ('Dehaze', 'dehaze', -100, 100, 0, 1, 0))] +
               [spec('Amount', '', 0, 100, 100, path=('mask', 'amount')),
                spec('Feather', '', 0, 100, 50, path=('mask', 'feather')),
+               spec('Rotate', '', -180, 180, 0, 1, 0, path=('mask', 'rotate')),
+               spec('Tolerance', '', 0, 100, 30, path=('mask', 'tol')),
                spec('Range min', '', 0, 100, 0, path=('mask', 'lum_lo')),
                spec('Range max', '', 0, 100, 100, path=('mask', 'lum_hi')),
                spec('Brush size', '', 1, 50, 5, path=('brush', 'size')),

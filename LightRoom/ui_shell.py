@@ -1899,6 +1899,25 @@ class MaskPanel(Page):
             self.tool_btns[t] = b
             row.addWidget(b)
         self.lay.addLayout(row)
+        row = QHBoxLayout()
+        b = pill('Auto select', lambda _=False: win.toggle_mask_tool('auto'), True, icon='auto')
+        b.setStyleSheet('padding:5px 8px;')
+        b.setToolTip('Click an area (or drag a box around a subject) and it is selected for you.  (A)')
+        self.tool_btns['auto'] = b
+        row.addWidget(b)
+        self.lay.addLayout(row)
+        row = QHBoxLayout()
+        for txt, kind in (('Subject', 'subject'), ('Background', 'background')):
+            b2 = pill(txt, lambda _=False, k=kind: win.make_auto_whole(k), False, icon='auto')
+            b2.setStyleSheet('padding:5px 8px;')
+            b2.setToolTip('Scans the whole photo and masks the ' + kind + ' automatically.')
+            row.addWidget(b2)
+        self.lay.addLayout(row)
+        tip = QLabel('Auto select: click an area, or drag a box around a subject.\n'
+                     'Shift + click adds more, Option / Alt + click takes away.')
+        tip.setWordWrap(True)
+        tip.setStyleSheet(f'color:{TXT_DIM};padding:2px 2px 4px 2px;font-size:11px;')
+        self.lay.addWidget(tip)
         self.hint = QLabel('Pick a tool, then drag on the photo.\nHover a mask + Delete removes it.')
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet(f'color:{TXT_DIM};padding:6px 2px;')
@@ -1918,7 +1937,7 @@ class MaskPanel(Page):
         self.lay.addLayout(row)
         self.win = win
         items = MASK_ITEMS
-        for title, part in (('Adjustments', items[:12]), ('Mask', items[12:16]), ('Brush', items[16:])):
+        for title, part in (('Adjustments', items[:12]), ('Mask', items[12:18]), ('Brush', items[18:])):
             self.lay.addWidget(Section(title))
             if title == 'Brush':
                 row = QHBoxLayout()

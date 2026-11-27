@@ -9,9 +9,11 @@ It also has a built-in converter that turns almost any image (RAW, HEIC, TIFF, W
 * **Light** - exposure, contrast, highlights, shadows, whites, blacks and a tone curve
 * **Color** - temp, tint, vibrance, saturation with colourful slider tracks, plus **Grading** and **Color mix**
 * **Blur**, **Effects** and **Detail** tabs (blur / glow / edge blur, texture, clarity, dehaze, vignette, grain, sharpening, noise reduction)
-* **Crop** and **Masks** tools
+* **Crop** and **Masks** tools - Linear, Radial, Brush and **Auto select** masks. Linear and Radial masks can be moved and rotated (see below)
+* **Auto select** (no AI) - click an area and everything of a similar colour is selected for you, or drag a box around a subject and it is cut out with OpenCV GrabCut
 * Live **histogram** - hover to enlarge, tap to switch view (RGB, Luminance, Red, Green, Blue, Waveform)
 * **Presets** and **History** drawers, **Before** view, undo / redo
+* **+ button** - adds a RAW photo (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF and more; ordinary JPG / PNG / TIFF work too)
 * **PNG converter** - hover the **+** button, then click the popup (RAW, DNG, HEIC, TIFF, WebP, GIF and more)
 
 ## What you need
@@ -22,7 +24,7 @@ It also has a built-in converter that turns almost any image (RAW, HEIC, TIFF, W
 | pip | comes with Python |
 | Operating system | macOS, Windows or Linux |
 
-Python packages (installed for you by `requirements.txt`): PySide6, opencv-python, numpy, Pillow, rawpy.
+Python packages (installed for you by `requirements.txt`): PySide6, numpy, opencv-python, scipy, Pillow, rawpy.
 Optional: `pillow-heif` for iPhone HEIC photos.
 
 ## Step 1 - Install Python
@@ -96,11 +98,14 @@ Next time you only need to activate the environment again (Step 3, second comman
 
 | Action | Shortcut |
 |---|---|
-| Open a photo | `Cmd/Ctrl + O` or drag a photo into the window |
 | Export | `Cmd/Ctrl + E` |
 | Next / previous photo in the folder | `Right` / `Left` |
 | Crop | `R` (`Enter` to apply, `Esc` to cancel) |
-| Masks | `L` / `O` / `B` |
+| Masks | `L` (linear) / `O` (radial) / `B` (brush) / `A` (auto select) |
+| Auto select | click an area, or drag a box around a subject. `Shift` + click adds more, `Option/Alt` + click takes away. Use the **Tolerance** slider to grow or shrink a clicked area |
+| Rotate a mask | drag the round **knob** with the circular arrow (hold `Shift` to snap to 15 degrees), or use the **Rotate** slider in the Masks tab |
+| Move a mask | drag the centre dot of a linear mask, or drag inside a radial mask (with the edit tool) |
+| Add a photo | click the **+** button, `Cmd/Ctrl + O`, or drop a file on the window |
 | Double-click a slider | reset it to default |
 | Double-click a slider's number | type an exact value |
 | Histogram | hover = enlarge, tap = next view, right-click = pick a view |
@@ -154,4 +159,3 @@ PyLight/
 ## License
 
 Add a license of your choice (for example MIT) - GitHub can create one for you via **Add file > Create new file > LICENSE**.
-# PyLight

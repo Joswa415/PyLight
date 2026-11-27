@@ -15,7 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
-RAW_EXT = {'.dng', '.cr2', '.cr3', '.nef', '.arw', '.orf', '.rw2', '.raf', '.pef', '.srw', '.raw'}
+RAW_EXT = {'.dng', '.cr2', '.cr3', '.crw', '.nef', '.nrw', '.arw', '.srf', '.sr2', '.orf', '.rw2', '.raf', '.pef',
+           '.srw', '.raw', '.rwl', '.3fr', '.erf', '.mef', '.mrw', '.kdc', '.dcr', '.iiq', '.x3f', '.gpr'}
 OTHER_EXT = {'.jpg', '.jpeg', '.jfif', '.png', '.tif', '.tiff', '.bmp', '.webp', '.gif', '.heic', '.heif',
              '.avif', '.ico', '.tga', '.ppm', '.pgm'}
 HEIC_EXT = {'.heic', '.heif', '.avif'}

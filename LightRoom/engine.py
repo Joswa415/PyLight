@@ -25,7 +25,8 @@ from PIL import Image, ImageCms, ImageOps
 from scipy.interpolate import PchipInterpolator
 
 Image.MAX_IMAGE_PIXELS = None
-RAW_EXT = {'.dng', '.cr2', '.cr3', '.nef', '.arw', '.orf', '.rw2', '.raf', '.pef', '.srw', '.raw'}
+RAW_EXT = {'.dng', '.cr2', '.cr3', '.crw', '.nef', '.nrw', '.arw', '.srf', '.sr2', '.orf', '.rw2', '.raf', '.pef',
+           '.srw', '.raw', '.rwl', '.3fr', '.erf', '.mef', '.mrw', '.kdc', '.dcr', '.iiq', '.x3f', '.gpr'}
 IMG_EXT = RAW_EXT | {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp'}
 BANDS = ['red', 'orange', 'yellow', 'green', 'aqua', 'blue', 'purple', 'magenta']
 BAND_HUES = [0, 30, 60, 120, 180, 240, 270, 300]
@@ -90,6 +91,8 @@ def new_mask(t):
         m.update(p1=[0.5, 0.3], p2=[0.5, 0.6])
     elif t == 'radial':
         m.update(c=[0.5, 0.5], r=[0.25, 0.25])
+    elif t == 'auto':
+        m.update(ops=[], tol=30, bmp='', feather=20)
     else:
         m['strokes'] = []
     return m
@@ -283,9 +286,14 @@ def compute_mask(m, h, w, x=None):
     elif t == 'radial':
         cx, cy = m['c']
         rx, ry = max(m['r'][0], 1e-4), max(m['r'][1], 1e-4)
-        d = np.sqrt(((px / w - cx) / rx) ** 2 + ((py / h - cy) / ry) ** 2)
+        ang = np.deg2rad(m.get('rot', 0.0))  # the ellipse can be turned
+        ca, sa = float(np.cos(ang)), float(np.sin(ang))
+        dxp, dyp = px - cx * w, py - cy * h
+        d = np.sqrt(((dxp * ca + dyp * sa) / (rx * w)) ** 2 + ((-dxp * sa + dyp * ca) / (ry * h)) ** 2)
         f = max(0.02, m.get('feather', 50) / 100)
         mk = 1 - sstep((d - (1 - f)) / f)
+    elif t == 'auto':
+        mk = auto_mask(m, h, w)
     else:
         mk = brush_mask(m.get('strokes', []), h, w)
     mk = mk.astype(np.float32)
@@ -296,6 +304,329 @@ def compute_mask(m, h, w, x=None):
         L = lum(x)
         mk = mk * np.clip((L - lo) / 0.08, 0, 1) * np.clip((hi - L) / 0.08, 0, 1)
     return mk * (m.get('amount', 100) / 100)
+
+
+# ----------------------------------------------------------------------------- auto select (no AI)
+# Click an area -> every connected pixel of a similar colour is selected ("magic wand", tolerance adjustable).
+# Drag a box -> OpenCV GrabCut cuts out the subject inside it.  The result is kept as a small PNG inside the mask
+# (base64), so it saves with the photo's settings and scales to any export size.
+_BMP_CACHE = {}
+
+
+def encode_mask(a):
+    ok, buf = cv2.imencode('.png', np.ascontiguousarray(a, np.uint8))
+    return base64.b64encode(buf.tobytes()).decode('ascii') if ok else ''
+
+
+def _decode_mask(s):
+    if not s:
+        return None
+    if s not in _BMP_CACHE:
+        if len(_BMP_CACHE) > 16:
+            _BMP_CACHE.clear()
+        a = cv2.imdecode(np.frombuffer(base64.b64decode(s), np.uint8), cv2.IMREAD_GRAYSCALE)
+        _BMP_CACHE[s] = None if a is None else a.astype(np.float32) / 255.0
+    return _BMP_CACHE[s]
+
+
+def auto_mask(m, h, w):
+    low = _decode_mask(m.get('bmp'))
+    if low is None:
+        return np.zeros((h, w), np.float32)
+    sig = max(0.6, (0.002 + m.get('feather', 20) / 100 * 0.02) * max(low.shape))  # edge softness
+    low = cv2.GaussianBlur(low, (0, 0), sig)
+    return cv2.resize(low, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def auto_cache(frame_lin, edge=512):
+    """Work copies (<= 512 px) of the framed photo: plain BGR for GrabCut, smoothed Lab for the colour match."""
+    h, w = frame_lin.shape[:2]
+    s = min(1.0, edge / max(h, w))
+    small = cv2.resize(frame_lin, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA) if s < 1 else frame_lin
+    bgr = cv2.cvtColor((np.clip(lin_to_srgb(small), 0, 1) * 255 + 0.5).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    sm = cv2.bilateralFilter(bgr, 7, 28, 7)
+    sm = cv2.bilateralFilter(sm, 7, 28, 7)
+    return {'bgr': bgr, 'lab': cv2.cvtColor(sm, cv2.COLOR_BGR2LAB), 'rects': {}}
+
+
+def _component_at(binary, x, y, r=4):
+    """The connected blob of `binary` (uint8 0/1) that contains (x, y), or the nearest blob inside a small patch."""
+    n, lbl = cv2.connectedComponents(binary, connectivity=4)
+    k = lbl[y, x]
+    if k == 0:
+        patch = lbl[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1].ravel()
+        patch = patch[patch > 0]
+        if not len(patch):
+            return None
+        k = np.bincount(patch).argmax()
+    return (lbl == k).astype(np.uint8)
+
+
+def auto_from_point(lab, seed, tol):
+    h, w = lab.shape[:2]
+    x, y = int(min(w - 1, max(0, seed[0] * w))), int(min(h - 1, max(0, seed[1] * h)))
+    patch = lab[max(0, y - 2):y + 3, max(0, x - 2):x + 3].reshape(-1, 3)
+    ref = np.median(patch, axis=0).astype(np.float32)
+    d = lab.astype(np.float32) - ref
+    dist = np.sqrt((0.6 * d[..., 0]) ** 2 + d[..., 1] ** 2 + d[..., 2] ** 2)
+    cand = (dist <= 5 + tol * 0.55).astype(np.uint8)
+    reg = _component_at(cand, x, y)
+    if reg is None:
+        return None
+    k = max(3, int(0.006 * max(h, w)) | 1)
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    opened = cv2.morphologyEx(reg, cv2.MORPH_OPEN, ker)  # snips thin bridges so the region does not leak
+    reg = _component_at(opened, x, y, r=8) if opened.any() else reg
+    if reg is None:
+        return None
+    reg = cv2.morphologyEx(reg, cv2.MORPH_CLOSE, ker)
+    # fill small holes (specks), keep big ones (a window in a wall stays a window)
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(1 - reg, connectivity=4)
+    small = max(12, int(0.002 * h * w))
+    for i in range(1, n):
+        x0, y0, bw, bh, area = st[i]
+        if area < small and x0 > 0 and y0 > 0 and x0 + bw < w and y0 + bh < h:
+            reg[lbl == i] = 1
+    sm = cv2.GaussianBlur(reg.astype(np.float32), (0, 0), max(0.8, 0.005 * max(h, w)))
+    return ((sm > 0.5) * 255).astype(np.uint8)
+
+
+# ---- subject / background detection ("full process"): cues -> GrabCut -> clean-up -> edge snap -> clean-up
+_GC = cv2
+
+
+def _norm01(a):
+    lo, hi = np.percentile(a, 2), np.percentile(a, 98)
+    return np.clip((a - lo) / max(hi - lo, 1e-6), 0, 1).astype(np.float32)
+
+
+def _saliency(c):
+    """0..1 'how much does this pixel look like the subject'.  Three cues:
+    colour distance from the border colours, distance from the average colour, and sharpness (in-focus = subject)."""
+    h, w = c.shape[:2]
+    md = max(h, w)
+    lab = cv2.cvtColor(cv2.GaussianBlur(c, (0, 0), 1.2), cv2.COLOR_BGR2LAB).astype(np.float32)
+    wts = np.array([0.7, 1.0, 1.0], np.float32)
+    r = max(2, int(0.05 * min(h, w)))
+    ring = np.ones((h, w), bool)
+    ring[r:-r, r:-r] = False
+    ys, xs = np.nonzero(ring)
+    step = max(1, len(ys) // 4000)
+    ys, xs = ys[::step], xs[::step]
+    smp = np.ascontiguousarray(lab[ys, xs])
+    k = 3
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 15, 1.0)
+    _, labels, centers = cv2.kmeans(smp, k, None, crit, 2, cv2.KMEANS_PP_CENTERS)
+    labels = labels.ravel()
+    sides = [ys < r, ys >= h - r, xs < r, xs >= w - r]
+    ctrs = []
+    for i in range(k):  # a real background colour shows up on at least 2 sides of the photo (a table edge only on 1)
+        hit = sum(1 for sd in sides if sd.any() and ((labels[sd] == i).mean() >= 0.12))
+        if hit >= 2:
+            ctrs.append(centers[i])
+    if not ctrs:
+        ctrs = [centers[np.bincount(labels, minlength=k).argmax()]]
+    dbg = np.min([np.linalg.norm((lab - ct) * wts, axis=2) for ct in ctrs], axis=0)
+    dav = np.linalg.norm((lab - lab.reshape(-1, 3).mean(0)) * wts, axis=2)
+    g = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lap = np.abs(cv2.Laplacian(cv2.GaussianBlur(g, (0, 0), 0.8), cv2.CV_32F))
+    sh = cv2.GaussianBlur(lap, (0, 0), max(2.0, 0.015 * md))
+    p10, p90 = np.percentile(sh, 10), np.percentile(sh, 90)
+    ws = float(np.clip((p90 - p10) / (p90 + p10 + 1e-6), 0, 1)) * 0.2  # strong focus fall-off -> trust sharpness
+    sal = (0.45 * _norm01(dbg) + 0.2 * _norm01(dav) + ws * _norm01(sh)) / (0.65 + ws)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cen = np.exp(-(((xx / w - 0.5) ** 2) + ((yy / h - 0.5) ** 2)) / (2 * 0.35 ** 2))
+    sal = cv2.GaussianBlur(sal * (0.6 + 0.4 * cen), (0, 0), max(1.0, 0.008 * md))
+    return _norm01(sal), ring, lab
+
+
+def _lab_dist(lab, ref):
+    return np.linalg.norm((lab - ref) * np.array([0.7, 1, 1], np.float32), axis=-1)
+
+
+def _fill_if_similar(fg, region, lab, ref, thr):
+    """Add `region` (uint8 0/1) to fg only if its colour matches the subject (fills bites / holes, never background)."""
+    reg = (region > 0) & (fg == 0)
+    if reg.sum() < 4:
+        return
+    if _lab_dist(lab[reg], ref).mean() < thr:
+        fg[reg] = 1
+
+
+def _clean(fg, lab):
+    """Drop specks, fill notches and holes that are the SAME colour as the subject, and smooth the outline."""
+    fg = fg.astype(np.uint8)
+    h, w = fg.shape
+    md = max(h, w)
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    if n < 2:
+        return None
+    big = st[1:, cv2.CC_STAT_AREA].max()
+    fg = np.isin(lbl, [i for i in range(1, n) if st[i, cv2.CC_STAT_AREA] >= 0.1 * big]).astype(np.uint8)
+    ref = np.median(lab[fg > 0], axis=0)
+    k = max(3, int(0.015 * md) | 1)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    # notches along the outline (convexity defects) - filled when they look like the subject
+    cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    area = float(fg.sum())
+    for c in cnts:
+        if cv2.contourArea(c) < 0.1 * area or len(c) < 8:
+            continue
+        try:
+            hull = cv2.convexHull(c, returnPoints=False)
+            df = cv2.convexityDefects(c, hull)
+        except cv2.error:
+            continue
+        if df is None:
+            continue
+        for s, e, f, d in sorted(df.reshape(-1, 4).tolist(), key=lambda t: -t[3])[:40]:
+            if d / 256.0 > 0.09 * md or s >= e:
+                continue
+            tmp = np.zeros_like(fg)
+            cv2.fillPoly(tmp, [c[s:e + 1, 0]], 1)
+            _fill_if_similar(fg, tmp, lab, ref, 24)
+    # enclosed holes
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(1 - fg, connectivity=4)
+    edge = set(lbl[0].tolist()) | set(lbl[-1].tolist()) | set(lbl[:, 0].tolist()) | set(lbl[:, -1].tolist())
+    area = float(fg.sum())
+    for i in range(1, n):
+        if i in edge or st[i, cv2.CC_STAT_AREA] > 0.35 * area:
+            continue
+        if st[i, cv2.CC_STAT_AREA] < 0.0015 * area:
+            fg[lbl == i] = 1
+        else:
+            _fill_if_similar(fg, (lbl == i).astype(np.uint8), lab, ref, 26)
+    sm = cv2.GaussianBlur(fg.astype(np.float32), (0, 0), max(0.8, 0.005 * md))
+    return (sm > 0.5).astype(np.uint8)
+
+
+def _snap(c, fg, iters=2):
+    """Second GrabCut pass, only on a thin band around the outline, so the edge hugs the real subject edge."""
+    md = max(fg.shape)
+    k = max(3, int(0.014 * md) | 1)
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    m = np.full(fg.shape, cv2.GC_PR_BGD, np.uint8)
+    m[fg > 0] = cv2.GC_PR_FGD
+    m[cv2.erode(fg, ker) > 0] = cv2.GC_FGD
+    m[cv2.dilate(fg, ker) == 0] = cv2.GC_BGD
+    if not (m == cv2.GC_FGD).any() or not (m == cv2.GC_BGD).any():
+        return fg
+    try:
+        cv2.grabCut(c, m, None, np.zeros((1, 65)), np.zeros((1, 65)), iters, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return fg
+    return ((m == cv2.GC_FGD) | (m == cv2.GC_PR_FGD)).astype(np.uint8)
+
+
+def _purge(c, fg, lab):
+    """Photos with a blurred background: drop soft (edge-less) pixels that connect to the top / left / right border,
+    that is the out-of-focus wall seen between and around the twigs.  The bottom edge is skipped (subjects stand on it)."""
+    h, w = fg.shape
+    md = max(h, w)
+    g = cv2.GaussianBlur(cv2.cvtColor(c, cv2.COLOR_BGR2GRAY).astype(np.float32), (0, 0), 0.8)
+    mag = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))
+    en = cv2.GaussianBlur(mag, (0, 0), 1.2)
+    sh = cv2.GaussianBlur(en, (0, 0), max(2.0, 0.015 * md))
+    p10, p90 = np.percentile(sh, 10), np.percentile(sh, 90)
+    if (p90 - p10) / (p90 + p10 + 1e-6) < 0.6:  # no clear in-focus / out-of-focus split -> leave the mask alone
+        return fg
+    e8 = np.clip(en / max(np.percentile(en[fg > 0], 99), 1e-3) * 255, 0, 255).astype(np.uint8)
+    thr = float(max(cv2.threshold(e8[fg > 0].reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0], 12))
+    soft = ((e8 < thr * 0.5) & (fg > 0)).astype(np.uint8)
+    soft = cv2.morphologyEx(soft, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lbl = cv2.connectedComponents(soft, connectivity=4)
+    seeds = set(lbl[0].tolist()) | set(lbl[:, 0].tolist()) | set(lbl[:, -1].tolist())
+    seeds -= set(lbl[-1].tolist())
+    seeds.discard(0)
+    if not seeds:
+        return fg
+    drop = np.isin(lbl, list(seeds))
+    out = ((fg > 0) & ~drop).astype(np.uint8)
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(out, connectivity=8)
+    if n < 2:
+        return fg
+    big = st[1:, cv2.CC_STAT_AREA].max()
+    out = np.isin(lbl, [i for i in range(1, n) if st[i, cv2.CC_STAT_AREA] >= 0.04 * big]).astype(np.uint8)
+    sm = cv2.GaussianBlur(out.astype(np.float32), (0, 0), max(0.8, 0.004 * md))
+    return (sm > 0.5).astype(np.uint8)
+
+
+def auto_subject(bgr, rect=None, tol=30):
+    """Whole-photo subject cut-out (rect=None) or cut-out inside a box (rect = x0, y0, x1, y1 as 0..1 fractions).
+    Returns a uint8 0..255 mask the size of `bgr`, or None."""
+    H, W = bgr.shape[:2]
+    x0, y0, x1, y1 = 0, 0, W, H
+    if rect is not None:
+        x0, y0 = int(max(0, rect[0] * W)), int(max(0, rect[1] * H))
+        x1, y1 = int(min(W, rect[2] * W)), int(min(H, rect[3] * H))
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            return None
+    c = np.ascontiguousarray(bgr[y0:y1, x0:x1])
+    h, w = c.shape[:2]
+    sal, ring, lab = _saliency(c)
+    s8 = (sal * 255).astype(np.uint8)
+    t = cv2.threshold(s8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
+    t = float(np.clip(t * (1.3 - tol / 100.0), 25, 215))  # Tolerance: low = tight around the subject, high = generous
+    m = np.full((h, w), cv2.GC_PR_BGD, np.uint8)
+    m[s8 > t] = cv2.GC_PR_FGD
+    m[s8 > t + (255 - t) * 0.55] = cv2.GC_FGD
+    m[s8 < t * 0.45] = cv2.GC_BGD
+    m[ring & (s8 <= t)] = cv2.GC_BGD
+    fg = None
+    if (m == cv2.GC_FGD).sum() > 30 and (m == cv2.GC_BGD).sum() > 30:
+        try:
+            cv2.grabCut(c, m, None, np.zeros((1, 65)), np.zeros((1, 65)), 4, cv2.GC_INIT_WITH_MASK)
+            fg = ((m == cv2.GC_FGD) | (m == cv2.GC_PR_FGD)).astype(np.uint8)
+        except cv2.error:
+            fg = None
+    if fg is None or not 0.02 < fg.mean() < 0.96:
+        fg = (s8 > t).astype(np.uint8)  # GrabCut failed -> plain saliency threshold
+    fg = _clean(fg, lab)
+    if fg is None:
+        return None
+    fg = _clean(_snap(c, fg), lab)
+    if fg is None or not fg.any():
+        return None
+    fg = _purge(c, fg, lab)
+    soft = cv2.GaussianBlur(fg.astype(np.float32) * 255, (0, 0), max(0.7, 0.003 * max(h, w)))
+    out = np.zeros((H, W), np.uint8)
+    out[y0:y1, x0:x1] = np.clip(soft, 0, 255).astype(np.uint8)
+    return out
+
+
+def auto_from_rect(bgr, rect, tol=30):
+    """Box -> subject inside it (uses the full detection pipeline)."""
+    return auto_subject(bgr, rect, tol)
+
+
+def auto_build(cache, ops, tol):
+    """Replay the click / box / whole-photo steps ('set', 'add', 'sub') into one 0..255 mask."""
+    out = None
+    for op in ops:
+        if op.get('auto'):  # whole photo: 'subject' or 'background'
+            key = ('whole', int(tol) // 5)
+            if key not in cache['rects']:
+                cache['rects'][key] = auto_subject(cache['bgr'], None, tol)
+            b = cache['rects'][key]
+            if b is not None and op['auto'] == 'background':
+                b = 255 - b
+        elif 'seed' in op:
+            b = auto_from_point(cache['lab'], op['seed'], tol)
+        else:
+            key = tuple(round(v, 4) for v in op['rect']) + (int(tol) // 5,)
+            if key not in cache['rects']:
+                cache['rects'][key] = auto_from_rect(cache['bgr'], op['rect'], tol)
+            b = cache['rects'][key]
+        if b is None:
+            continue
+        if op['op'] == 'sub':
+            if out is not None:
+                out = np.where(b > 127, 0, out).astype(np.uint8)
+        elif op['op'] == 'add' and out is not None:
+            out = np.maximum(out, b)
+        else:
+            out = b.copy()
+    return out
 
 
 def brush_mask(strokes, h, w):
